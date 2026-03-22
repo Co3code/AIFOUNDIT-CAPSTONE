@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Image } from 'react-native';
 import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { auth, db } from '@/config/firebase';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, collection, getDocs, orderBy, query, limit } from 'firebase/firestore';
 
 export default function HomeScreen() {
   const [userName, setUserName] = useState('');
+  const [posts, setPosts] = useState<any[]>([]);
 
   useEffect(() => {
     const fetchUser = async () => {
@@ -16,23 +17,27 @@ export default function HomeScreen() {
         if (snap.exists()) setUserName(snap.data().name);
       }
     };
+    const fetchPosts = async () => {
+      const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(5));
+      const snap = await getDocs(q);
+      setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    };
     fetchUser();
+    fetchPosts();
   }, []);
 
   return (
     <ScrollView style={styles.container}>
-      {/* Header */}
       <View style={styles.header}>
         <View>
           <Text style={styles.greeting}>Hi, {userName || 'User'}</Text>
           <Text style={styles.subGreeting}>Find or report lost items</Text>
         </View>
         <TouchableOpacity>
-          <Ionicons name="search" size={24} color="#2563EB" />
+          <Ionicons name="search" size={24} color="#fff" />
         </TouchableOpacity>
       </View>
 
-      {/* Quick Actions */}
       <Text style={styles.sectionTitle}>Quick Actions</Text>
       <View style={styles.actions}>
         <TouchableOpacity style={[styles.actionCard, { backgroundColor: '#EFF6FF' }]} onPress={() => router.push('/(tabs)/post')}>
@@ -47,7 +52,6 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Recent Posts */}
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Recent Posts</Text>
         <TouchableOpacity>
@@ -55,25 +59,37 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
-      <View style={styles.emptyCard}>
-        <Ionicons name="file-tray-outline" size={40} color="#9CA3AF" />
-        <Text style={styles.emptyTitle}>No posts yet</Text>
-        <Text style={styles.emptyText}>Be the first to report a lost or found item</Text>
-      </View>
+      {posts.length === 0 ? (
+        <View style={styles.emptyCard}>
+          <Ionicons name="file-tray-outline" size={40} color="#9CA3AF" />
+          <Text style={styles.emptyTitle}>No posts yet</Text>
+          <Text style={styles.emptyText}>Be the first to report a lost or found item</Text>
+        </View>
+      ) : (
+        <View style={styles.postsList}>
+          {posts.map(post => (
+            <View key={post.id} style={styles.postCard}>
+              {post.imageUrl && <Image source={{ uri: post.imageUrl }} style={styles.postImage} />}
+              <View style={styles.postInfo}>
+                <View style={[styles.postBadge, { backgroundColor: post.type === 'lost' ? '#FEF2F2' : '#F0FDF4' }]}>
+                  <Text style={[styles.postBadgeText, { color: post.type === 'lost' ? '#EF4444' : '#16A34A' }]}>
+                    {post.type?.toUpperCase()}
+                  </Text>
+                </View>
+                <Text style={styles.postTitle}>{post.title}</Text>
+                <Text style={styles.postLocation}>{post.location}</Text>
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F3F4F6' },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 24,
-    paddingTop: 56,
-    backgroundColor: '#2563EB',
-  },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 24, paddingTop: 56, backgroundColor: '#2563EB' },
   greeting: { fontSize: 22, fontWeight: 'bold', color: '#fff' },
   subGreeting: { fontSize: 13, color: '#BFDBFE', marginTop: 2 },
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginHorizontal: 24, marginTop: 24, marginBottom: 12 },
@@ -86,4 +102,12 @@ const styles = StyleSheet.create({
   emptyCard: { margin: 24, padding: 40, backgroundColor: '#fff', borderRadius: 12, alignItems: 'center', gap: 8 },
   emptyTitle: { fontSize: 15, fontWeight: 'bold', color: '#374151' },
   emptyText: { color: '#9CA3AF', fontSize: 13, textAlign: 'center' },
+  postsList: { marginHorizontal: 24, gap: 12, marginBottom: 24 },
+  postCard: { backgroundColor: '#fff', borderRadius: 12, overflow: 'hidden' },
+  postImage: { width: '100%', height: 160 },
+  postInfo: { padding: 12, gap: 4 },
+  postBadge: { alignSelf: 'flex-start', paddingHorizontal: 10, paddingVertical: 3, borderRadius: 20 },
+  postBadgeText: { fontSize: 11, fontWeight: 'bold' },
+  postTitle: { fontSize: 14, fontWeight: 'bold', color: '#111827' },
+  postLocation: { fontSize: 12, color: '#6B7280' },
 });
