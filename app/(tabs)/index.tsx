@@ -8,6 +8,7 @@ import { doc, getDoc, collection, getDocs, orderBy, query, limit } from 'firebas
 export default function HomeScreen() {
   const [userName, setUserName] = useState('');
   const [posts, setPosts] = useState<any[]>([]);
+  const [showAll, setShowAll] = useState(false);
 
   useEffect(() => {
     const fetchUser = async () => {
@@ -18,13 +19,16 @@ export default function HomeScreen() {
       }
     };
     const fetchPosts = async () => {
-      const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'), limit(5));
+      let q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
+      if (!showAll) {
+        q = query(q, limit(5));
+      }
       const snap = await getDocs(q);
       setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     };
     fetchUser();
     fetchPosts();
-  }, []);
+  }, [showAll]);
 
   return (
     <ScrollView style={styles.container}>
@@ -53,9 +57,9 @@ export default function HomeScreen() {
       </View>
 
       <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Recent Posts</Text>
-        <TouchableOpacity>
-          <Text style={styles.seeAll}>See all</Text>
+        <Text style={styles.sectionTitle}>{showAll ? 'All Posts' : 'Recent Posts'}</Text>
+        <TouchableOpacity onPress={() => setShowAll(!showAll)}>
+          <Text style={styles.seeAll}>{showAll ? 'Show less' : 'See all'}</Text>
         </TouchableOpacity>
       </View>
 

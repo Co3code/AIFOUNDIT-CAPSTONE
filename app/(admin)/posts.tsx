@@ -1,70 +1,170 @@
-import { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
-import { db } from '@/config/firebase';
-import { collection, getDocs, deleteDoc, doc } from 'firebase/firestore';
+import { db } from "@/config/firebase";
+import { Ionicons } from "@expo/vector-icons";
+import { collection, deleteDoc, doc, getDocs, query, updateDoc, where } from "firebase/firestore";
+import { useCallback, useEffect, useState } from "react";
+import { ActivityIndicator, Alert, FlatList, Image, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
-type Post = { id: string; title: string; type: string; description: string; postedBy: string; };
+type Post = {
+  id: string;
+  title: string;
+  type: string;
+  description: string;
+  postedBy: string;
+  imageUrl?: string;
+};
 
 export default function PostsScreen() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const fetchPosts = async () => {
-    const snap = await getDocs(collection(db, 'posts'));
-    setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() } as Post)));
-    setLoading(false);
+  const fetchPosts = useCallback(async (isPull = false) => {
+    if (isPull) setRefreshing(true);
+    else setLoading(true);
+    try {
+      const snap = await getDocs(collection(db, "posts"));
+      setPosts(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as Post));
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPosts();
+  }, [fetchPosts]);
+
+  // ✅ Fix: also cleans up match docs referencing this post
+  const purgePostAndMatches = async (postId: string) => {
+    // 1. Delete match docs where this post is the primary
+    const primarySnap = await getDocs(query(collection(db, "matches"), where("postId", "==", postId)));
+    await Promise.all(primarySnap.docs.map((d) => deleteDoc(doc(db, "matches", d.id))));
+
+    // 2. Delete the post itself
+    await deleteDoc(doc(db, "posts", postId));
   };
 
-  useEffect(() => { fetchPosts(); }, []);
-
-  const handleDelete = (id: string) => {
-    Alert.alert('Delete Post', 'Are you sure you want to delete this post?', [
-      { text: 'Cancel', style: 'cancel' },
+  const handleDeletePost = (item: Post) => {
+    // ✅ Fix: double confirmation like users delete
+    Alert.alert("Delete Post", `Remove "${item.title}"?`, [
+      { text: "Cancel", style: "cancel" },
       {
-        text: 'Delete', style: 'destructive', onPress: async () => {
-          await deleteDoc(doc(db, 'posts', id));
-          setPosts(prev => prev.filter(p => p.id !== id));
-        }
-      }
+        text: "Continue",
+        style: "destructive",
+        onPress: () => {
+          Alert.alert(
+            "⚠️ Final Warning",
+            "This will permanently delete the post and its match records. Cannot be undone.",
+            [
+              { text: "Cancel", style: "cancel" },
+              {
+                text: "Yes, Delete",
+                style: "destructive",
+                onPress: async () => {
+                  setDeletingId(item.id);
+                  try {
+                    await purgePostAndMatches(item.id);
+                    setPosts((prev) => prev.filter((p) => p.id !== item.id));
+                  } catch (e: any) {
+                    Alert.alert("Error", e?.message ?? "Could not delete.");
+                  } finally {
+                    setDeletingId(null);
+                  }
+                },
+              },
+            ],
+          );
+        },
+      },
     ]);
   };
 
-  if (loading) return <ActivityIndicator style={{ flex: 1 }} color="#2563EB" />;
+  const handleRemovePhotoOnly = (item: Post) => {
+    if (!item.imageUrl) return;
+    Alert.alert(
+      "Remove photo",
+      "Keep the post but clear the image URL? (Cloudinary file may still exist until you delete it there.)",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove photo",
+          onPress: async () => {
+            try {
+              await updateDoc(doc(db, "posts", item.id), { imageUrl: null });
+              setPosts((prev) => prev.map((p) => (p.id === item.id ? { ...p, imageUrl: undefined } : p)));
+            } catch (e: any) {
+              Alert.alert("Error", e?.message ?? "Could not update.");
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  if (loading) return <ActivityIndicator style={{ flex: 1 }} color="#F59E0B" />;
 
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Posts</Text>
-        <Text style={styles.subtitle}>{posts.length} total posts</Text>
+        <Text style={styles.subtitle}>{posts.length} total · admin</Text>
       </View>
 
       {posts.length === 0 ? (
         <View style={styles.empty}>
-          <Ionicons name="file-tray-outline" size={40} color="#9CA3AF" />
+          <Ionicons name="file-tray-outline" size={40} color="#64748B" />
           <Text style={styles.emptyTitle}>No posts yet</Text>
         </View>
       ) : (
         <FlatList
           data={posts}
-          keyExtractor={item => item.id}
-          contentContainerStyle={{ padding: 24, gap: 12 }}
-          renderItem={({ item }) => (
-            <View style={styles.card}>
-              <View style={[styles.typeBadge, { backgroundColor: item.type === 'lost' ? '#FEF2F2' : '#F0FDF4' }]}>
-                <Text style={[styles.typeText, { color: item.type === 'lost' ? '#EF4444' : '#16A34A' }]}>
-                  {item.type?.toUpperCase()}
-                </Text>
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={{ padding: 16, gap: 12, paddingBottom: 32 }}
+          refreshing={refreshing}
+          onRefresh={() => fetchPosts(true)}
+          renderItem={({ item }) => {
+            const isDeleting = deletingId === item.id;
+            return (
+              <View style={[styles.card, isDeleting && { opacity: 0.5 }]}>
+                {item.imageUrl ? (
+                  <Image source={{ uri: item.imageUrl }} style={styles.thumb} />
+                ) : (
+                  <View style={[styles.thumb, styles.thumbPlaceholder]}>
+                    <Ionicons name="image-outline" size={28} color="#64748B" />
+                  </View>
+                )}
+                <View style={styles.info}>
+                  <View style={[styles.typeBadge, { backgroundColor: item.type === "lost" ? "#450A0A" : "#052E16" }]}>
+                    <Text style={[styles.typeText, { color: item.type === "lost" ? "#FCA5A5" : "#86EFAC" }]}>
+                      {item.type?.toUpperCase()}
+                    </Text>
+                  </View>
+                  <Text style={styles.postTitle}>{item.title}</Text>
+                  <Text style={styles.postDesc} numberOfLines={2}>
+                    {item.description}
+                  </Text>
+                  <Text style={styles.meta}>User: {item.postedBy?.slice(0, 8) ?? "—"}…</Text>
+                </View>
+                <View style={styles.rowActions}>
+                  {isDeleting ? (
+                    <ActivityIndicator size="small" color="#F59E0B" />
+                  ) : (
+                    <>
+                      {item.imageUrl ? (
+                        <TouchableOpacity style={styles.smallBtn} onPress={() => handleRemovePhotoOnly(item)}>
+                          <Ionicons name="image-outline" size={18} color="#FBBF24" />
+                        </TouchableOpacity>
+                      ) : null}
+                      <TouchableOpacity style={styles.smallBtnDanger} onPress={() => handleDeletePost(item)}>
+                        <Ionicons name="trash-outline" size={18} color="#F87171" />
+                      </TouchableOpacity>
+                    </>
+                  )}
+                </View>
               </View>
-              <View style={styles.info}>
-                <Text style={styles.postTitle}>{item.title}</Text>
-                <Text style={styles.postDesc} numberOfLines={1}>{item.description}</Text>
-              </View>
-              <TouchableOpacity onPress={() => handleDelete(item.id)}>
-                <Ionicons name="trash-outline" size={20} color="#EF4444" />
-              </TouchableOpacity>
-            </View>
-          )}
+            );
+          }}
         />
       )}
     </View>
@@ -72,16 +172,47 @@ export default function PostsScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F3F4F6' },
-  header: { padding: 24, paddingTop: 56, backgroundColor: '#2563EB' },
-  title: { fontSize: 22, fontWeight: 'bold', color: '#fff' },
-  subtitle: { fontSize: 13, color: '#BFDBFE', marginTop: 2 },
-  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
-  emptyTitle: { fontSize: 15, fontWeight: 'bold', color: '#374151' },
-  card: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 16, borderRadius: 12, gap: 12 },
-  typeBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 },
-  typeText: { fontSize: 11, fontWeight: 'bold' },
-  info: { flex: 1 },
-  postTitle: { fontSize: 14, fontWeight: 'bold', color: '#111827' },
-  postDesc: { fontSize: 12, color: '#6B7280', marginTop: 2 },
+  container: { flex: 1, backgroundColor: "#0F172A" },
+  header: {
+    padding: 24,
+    paddingTop: 56,
+    backgroundColor: "#1E293B",
+    borderBottomWidth: 1,
+    borderBottomColor: "#334155",
+  },
+  title: { fontSize: 22, fontWeight: "bold", color: "#F8FAFC" },
+  subtitle: { fontSize: 13, color: "#F59E0B", marginTop: 4, fontWeight: "600" },
+  empty: { flex: 1, justifyContent: "center", alignItems: "center", gap: 8 },
+  emptyTitle: { fontSize: 15, fontWeight: "bold", color: "#94A3B8" },
+  card: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#1E293B",
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#334155",
+    gap: 12,
+  },
+  thumb: { width: 72, height: 72, borderRadius: 10, backgroundColor: "#0F172A" },
+  thumbPlaceholder: { alignItems: "center", justifyContent: "center" },
+  info: { flex: 1, minWidth: 0 },
+  typeBadge: { alignSelf: "flex-start", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 20 },
+  typeText: { fontSize: 10, fontWeight: "bold" },
+  postTitle: { fontSize: 14, fontWeight: "bold", color: "#F8FAFC", marginTop: 6 },
+  postDesc: { fontSize: 12, color: "#94A3B8", marginTop: 2 },
+  meta: { fontSize: 10, color: "#64748B", marginTop: 4 },
+  rowActions: { alignItems: "center", gap: 6, minWidth: 36 },
+  smallBtn: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: "rgba(245, 158, 11, 0.15)",
+    borderWidth: 1,
+    borderColor: "rgba(245, 158, 11, 0.35)",
+  },
+  smallBtnDanger: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: "rgba(185, 28, 28, 0.2)",
+  },
 });

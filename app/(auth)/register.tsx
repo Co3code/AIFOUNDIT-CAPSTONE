@@ -8,6 +8,7 @@ import { auth, db } from '@/config/firebase';
 export default function RegisterScreen() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [loading, setLoading] = useState(false);
@@ -21,6 +22,7 @@ export default function RegisterScreen() {
       await setDoc(doc(db, 'users', userCredential.user.uid), {
         name,
         email,
+        ...(phone.trim() ? { phone: phone.trim() } : {}),
         createdAt: new Date(),
       });
       await signOut(auth);
@@ -41,6 +43,7 @@ export default function RegisterScreen() {
 
       <TextInput style={styles.input} placeholder="Full Name" value={name} onChangeText={setName} />
       <TextInput style={styles.input} placeholder="Email" keyboardType="email-address" autoCapitalize="none" value={email} onChangeText={setEmail} />
+      <TextInput style={styles.input} placeholder="Phone (optional)" keyboardType="phone-pad" value={phone} onChangeText={setPhone} />
       <TextInput style={styles.input} placeholder="Password" secureTextEntry value={password} onChangeText={setPassword} />
       <TextInput style={styles.input} placeholder="Confirm Password" secureTextEntry value={confirm} onChangeText={setConfirm} />
 

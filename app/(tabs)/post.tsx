@@ -1,21 +1,59 @@
-import { useState } from 'react';
+import { CLOUDINARY_UPLOAD_PRESET, CLOUDINARY_UPLOAD_URL } from "@/config/cloudinary";
+import { auth, db } from "@/config/firebase";
+import { combinedScoreToPercent, compareImages, compareText, embeddingSimilarityTo01 } from "@/config/similarity";
+import { Ionicons } from "@expo/vector-icons";
+import * as ImagePicker from "expo-image-picker";
+import { addDoc, collection, doc, getDocs, query, serverTimestamp, setDoc, where } from "firebase/firestore";
+import { useState } from "react";
 import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ScrollView, Image, Alert, ActivityIndicator
-} from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
-import { Ionicons } from '@expo/vector-icons';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
-import { auth, db } from '@/config/firebase';
-import { CLOUDINARY_UPLOAD_URL, CLOUDINARY_UPLOAD_PRESET } from '@/config/cloudinary';
+  ActivityIndicator,
+  Alert,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+
+// ─── FIX 1: Deduplicated upsert — one doc per postId, no duplicates ──────────
+async function upsertMatchEntry(postId: string, otherPostId: string, score: number) {
+  const q = query(collection(db, "matches"), where("postId", "==", postId));
+  const snap = await getDocs(q);
+  const entry = { postId: otherPostId, score };
+
+  if (snap.empty) {
+    // No existing doc for this postId → create one
+    await addDoc(collection(db, "matches"), {
+      postId,
+      matches: [entry],
+      createdAt: serverTimestamp(),
+    });
+    return;
+  }
+
+  const matchDoc = snap.docs[0];
+  const existing: { postId: string; score: number }[] = matchDoc.data().matches || [];
+  const idx = existing.findIndex((x) => x.postId === otherPostId);
+
+  const next =
+    idx >= 0
+      ? existing.map((x, i) => (i === idx ? { ...x, score: Math.max(x.score, score) } : x))
+      : [...existing, entry];
+
+  // Use setDoc with merge to safely update
+  await setDoc(doc(db, "matches", matchDoc.id), { matches: next }, { merge: true });
+}
 
 export default function PostScreen() {
-  const [type, setType] = useState<'lost' | 'found'>('lost');
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [location, setLocation] = useState('');
+  const [type, setType] = useState<"lost" | "found">("lost");
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [location, setLocation] = useState("");
   const [image, setImage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
 
   const pickImage = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -28,77 +66,162 @@ export default function PostScreen() {
 
   const takePhoto = async () => {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
-    if (!permission.granted) return Alert.alert('Permission required', 'Camera permission is needed');
-    const result = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
-      quality: 0.7,
-    });
+    if (!permission.granted) return Alert.alert("Permission required", "Camera permission is needed");
+    const result = await ImagePicker.launchCameraAsync({ allowsEditing: true, quality: 0.7 });
     if (!result.canceled) setImage(result.assets[0].uri);
   };
 
-  const uploadImage = async (uri: string) => {
+  const uploadImage = async (uri: string): Promise<string> => {
     const formData = new FormData();
-    formData.append('file', { uri, type: 'image/jpeg', name: 'photo.jpg' } as any);
-    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-    const res = await fetch(CLOUDINARY_UPLOAD_URL, { method: 'POST', body: formData });
+    formData.append("file", { uri, type: "image/jpeg", name: "photo.jpg" } as any);
+    formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+    const res = await fetch(CLOUDINARY_UPLOAD_URL, { method: "POST", body: formData });
     const data = await res.json();
+    if (!data.secure_url) throw new Error("Image upload failed");
     return data.secure_url;
+  };
+
+  // ─── FIX 2: Smarter scoring — image is optional, weights adjust accordingly ─
+  const computeScore = async (
+    newPost: { imageUrl: string; description: string; location: string; title: string; type: string },
+    otherPost: any,
+  ): Promise<number> => {
+    const hasImages = !!newPost.imageUrl && !!otherPost.imageUrl;
+
+    let imageScore01 = 0;
+    if (hasImages) {
+      const raw = await compareImages(newPost.imageUrl, otherPost.imageUrl as string);
+      imageScore01 = embeddingSimilarityTo01(raw);
+    }
+
+    const descScore = compareText(newPost.description, otherPost.description ?? "");
+    const locScore = compareText(newPost.location, otherPost.location ?? "");
+    const titleScore = compareText(newPost.title, otherPost.title ?? "");
+
+    // FIX 2b: If no images, redistribute image weight to text fields
+    const combined = hasImages
+      ? imageScore01 * 0.4 + descScore * 0.3 + locScore * 0.2 + titleScore * 0.1
+      : descScore * 0.45 + locScore * 0.3 + titleScore * 0.25;
+
+    return combinedScoreToPercent(combined);
+  };
+
+  // ─── FIX 3: Parallel image comparison using Promise.all ───────────────────
+  const findMatches = async (
+    newImageUrl: string,
+    newPost: { type: string; description: string; location: string; title: string },
+    currentUid: string,
+    newPostId: string,
+  ) => {
+    const oppositeType = newPost.type === "lost" ? "found" : "lost";
+    const snap = await getDocs(query(collection(db, "posts"), where("type", "==", oppositeType)));
+
+    const candidates = snap.docs.filter((d) => d.data().postedBy !== currentUid);
+
+    // FIX 3: Run all comparisons in parallel instead of serial loop
+    const scoreResults = await Promise.all(
+      candidates.map(async (docSnap) => {
+        const post = docSnap.data();
+        const score = await computeScore({ imageUrl: newImageUrl, ...newPost }, post);
+        return { id: docSnap.id, post, score };
+      }),
+    );
+
+    // Filter threshold and sort
+    const THRESHOLD = 28; // 28% minimum confidence
+    return scoreResults.filter((r) => r.score >= THRESHOLD).sort((a, b) => b.score - a.score);
   };
 
   const handleSubmit = async () => {
     if (!title || !description || !location || !image)
-      return Alert.alert('Error', 'Please fill in all fields and add an image');
+      return Alert.alert("Error", "Please fill in all fields and add an image");
+
     setLoading(true);
     try {
+      setStatusMsg("Uploading image...");
       const imageUrl = await uploadImage(image);
-      await addDoc(collection(db, 'posts'), {
+
+      setStatusMsg("Saving post...");
+      const uid = auth.currentUser?.uid;
+      if (!uid) throw new Error("Not signed in");
+
+      const docRef = await addDoc(collection(db, "posts"), {
         type,
         title,
         description,
         location,
         imageUrl,
-        postedBy: auth.currentUser?.uid,
+        postedBy: uid,
         createdAt: serverTimestamp(),
       });
-      Alert.alert('Success', 'Post submitted successfully!');
-      setTitle('');
-      setDescription('');
-      setLocation('');
+
+      setStatusMsg("Finding matches... (this may take a moment)");
+      const matches = await findMatches(imageUrl, { type, description, location, title }, uid, docRef.id);
+
+      // ─── FIX 4: Write matches ONCE via upsertMatchEntry only — no double addDoc ─
+      if (matches.length > 0) {
+        // Write match doc for the new post (one doc, all matches)
+        await upsertMatchEntry(docRef.id, matches[0].id, matches[0].score);
+        for (let i = 1; i < matches.length; i++) {
+          await upsertMatchEntry(docRef.id, matches[i].id, matches[i].score);
+        }
+        // Write reverse match entries so the other users also see this post
+        for (const m of matches) {
+          await upsertMatchEntry(m.id, docRef.id, m.score);
+        }
+        Alert.alert(
+          "🎉 Match Found!",
+          `We found ${matches.length} possible match${matches.length > 1 ? "es" : ""} for your item!\nCheck the Matches tab.`,
+        );
+      } else {
+        Alert.alert("✅ Post Submitted", "No matches yet. We'll notify you when one is found.");
+      }
+
+      // Reset form
+      setTitle("");
+      setDescription("");
+      setLocation("");
       setImage(null);
+      setType("lost");
     } catch (error: any) {
-      Alert.alert('Error', error.message);
+      console.error("Submit error:", error);
+      Alert.alert("Error", error.message ?? "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
+      setStatusMsg("");
     }
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
       <View style={styles.header}>
         <Text style={styles.title}>Report Item</Text>
         <Text style={styles.subtitle}>Lost or found something?</Text>
       </View>
 
-      {/* Type Selector */}
       <View style={styles.typeRow}>
         <TouchableOpacity
-          style={[styles.typeBtn, type === 'lost' && styles.typeBtnActiveLost]}
-          onPress={() => setType('lost')}>
-          <Text style={[styles.typeBtnText, type === 'lost' && { color: '#fff' }]}>Lost</Text>
+          style={[styles.typeBtn, type === "lost" && styles.typeBtnActiveLost]}
+          onPress={() => setType("lost")}
+        >
+          <Ionicons name="search-outline" size={16} color={type === "lost" ? "#fff" : "#6B7280"} />
+          <Text style={[styles.typeBtnText, type === "lost" && { color: "#fff" }]}>Lost</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.typeBtn, type === 'found' && styles.typeBtnActiveFound]}
-          onPress={() => setType('found')}>
-          <Text style={[styles.typeBtnText, type === 'found' && { color: '#fff' }]}>Found</Text>
+          style={[styles.typeBtn, type === "found" && styles.typeBtnActiveFound]}
+          onPress={() => setType("found")}
+        >
+          <Ionicons name="checkmark-circle-outline" size={16} color={type === "found" ? "#fff" : "#6B7280"} />
+          <Text style={[styles.typeBtnText, type === "found" && { color: "#fff" }]}>Found</Text>
         </TouchableOpacity>
       </View>
 
       <View style={styles.form}>
-        {/* Image Picker */}
         <Text style={styles.label}>Photo</Text>
         {image ? (
           <TouchableOpacity onPress={pickImage}>
             <Image source={{ uri: image }} style={styles.imagePreview} />
+            <Text style={styles.changePhoto}>Tap to change photo</Text>
           </TouchableOpacity>
         ) : (
           <View style={styles.imageButtons}>
@@ -114,45 +237,112 @@ export default function PostScreen() {
         )}
 
         <Text style={styles.label}>Item Name</Text>
-        <TextInput style={styles.input} placeholder="e.g. Black Wallet" value={title} onChangeText={setTitle} />
+        <TextInput
+          style={styles.input}
+          placeholder="e.g. Black Wallet"
+          placeholderTextColor="#9CA3AF"
+          value={title}
+          onChangeText={setTitle}
+        />
 
         <Text style={styles.label}>Description</Text>
         <TextInput
           style={[styles.input, { height: 80 }]}
-          placeholder="Describe the item..."
+          placeholder="Describe the item in detail..."
+          placeholderTextColor="#9CA3AF"
           multiline
           value={description}
           onChangeText={setDescription}
         />
 
         <Text style={styles.label}>Location</Text>
-        <TextInput style={styles.input} placeholder="Where was it lost/found?" value={location} onChangeText={setLocation} />
+        <TextInput
+          style={styles.input}
+          placeholder="Where was it lost/found?"
+          placeholderTextColor="#9CA3AF"
+          value={location}
+          onChangeText={setLocation}
+        />
 
-        <TouchableOpacity style={styles.submitBtn} onPress={handleSubmit} disabled={loading}>
-          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitText}>Submit Post</Text>}
+        <TouchableOpacity
+          style={[styles.submitBtn, loading && styles.submitBtnDisabled]}
+          onPress={handleSubmit}
+          disabled={loading}
+        >
+          {loading ? (
+            <View style={styles.loadingRow}>
+              <ActivityIndicator color="#fff" size="small" />
+              <Text style={styles.submitText}>{statusMsg || "Processing..."}</Text>
+            </View>
+          ) : (
+            <Text style={styles.submitText}>Submit Post</Text>
+          )}
         </TouchableOpacity>
+
+        {loading && <Text style={styles.loadingHint}>AI matching is running in the background. Please wait...</Text>}
       </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F3F4F6' },
-  header: { padding: 24, paddingTop: 56, backgroundColor: '#2563EB' },
-  title: { fontSize: 22, fontWeight: 'bold', color: '#fff' },
-  subtitle: { fontSize: 13, color: '#BFDBFE', marginTop: 2 },
-  typeRow: { flexDirection: 'row', margin: 24, gap: 12 },
-  typeBtn: { flex: 1, padding: 12, borderRadius: 8, alignItems: 'center', borderWidth: 1, borderColor: '#D1D5DB', backgroundColor: '#fff' },
-  typeBtnActiveLost: { backgroundColor: '#EF4444', borderColor: '#EF4444' },
-  typeBtnActiveFound: { backgroundColor: '#16A34A', borderColor: '#16A34A' },
-  typeBtnText: { fontWeight: 'bold', color: '#6B7280' },
-  form: { paddingHorizontal: 24, gap: 6, paddingBottom: 40 },
-  label: { fontSize: 13, fontWeight: '600', color: '#374151', marginTop: 8 },
-  input: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 8, padding: 12 },
-  imageButtons: { flexDirection: 'row', gap: 12 },
-  imageBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#fff', borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 8, padding: 16 },
-  imageBtnText: { color: '#2563EB', fontWeight: '600' },
-  imagePreview: { width: '100%', height: 200, borderRadius: 12 },
-  submitBtn: { backgroundColor: '#2563EB', padding: 14, borderRadius: 8, alignItems: 'center', marginTop: 16 },
-  submitText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  container: { flex: 1, backgroundColor: "#F3F4F6" },
+  header: { padding: 24, paddingTop: 56, backgroundColor: "#2563EB" },
+  title: { fontSize: 22, fontWeight: "bold", color: "#fff" },
+  subtitle: { fontSize: 13, color: "#BFDBFE", marginTop: 2 },
+  typeRow: { flexDirection: "row", margin: 24, gap: 12 },
+  typeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    backgroundColor: "#fff",
+  },
+  typeBtnActiveLost: { backgroundColor: "#EF4444", borderColor: "#EF4444" },
+  typeBtnActiveFound: { backgroundColor: "#16A34A", borderColor: "#16A34A" },
+  typeBtnText: { fontWeight: "bold", color: "#6B7280" },
+  form: { paddingHorizontal: 24, gap: 6, paddingBottom: 60 },
+  label: { fontSize: 13, fontWeight: "600", color: "#374151", marginTop: 8 },
+  input: {
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    borderRadius: 8,
+    padding: 12,
+    color: "#111827",
+  },
+  imageButtons: { flexDirection: "row", gap: 12 },
+  imageBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    borderRadius: 8,
+    padding: 16,
+  },
+  imageBtnText: { color: "#2563EB", fontWeight: "600" },
+  imagePreview: { width: "100%", height: 200, borderRadius: 12 },
+  changePhoto: { textAlign: "center", color: "#6B7280", fontSize: 12, marginTop: 6 },
+  submitBtn: {
+    backgroundColor: "#2563EB",
+    padding: 14,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 16,
+    minHeight: 50,
+    justifyContent: "center",
+  },
+  submitBtnDisabled: { backgroundColor: "#93C5FD" },
+  loadingRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  submitText: { color: "#fff", fontWeight: "bold", fontSize: 16 },
+  loadingHint: { textAlign: "center", color: "#9CA3AF", fontSize: 12, marginTop: 8 },
 });

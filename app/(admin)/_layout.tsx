@@ -32,9 +32,9 @@ export default function AdminLayout() {
     <Tabs
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: '#2563EB',
-        tabBarInactiveTintColor: '#9CA3AF',
-        tabBarStyle: { backgroundColor: '#fff', borderTopColor: '#E5E7EB' },
+        tabBarActiveTintColor: '#F59E0B',
+        tabBarInactiveTintColor: '#64748B',
+        tabBarStyle: { backgroundColor: '#1E293B', borderTopColor: '#334155' },
       }}>
       <Tabs.Screen
         name="index"
