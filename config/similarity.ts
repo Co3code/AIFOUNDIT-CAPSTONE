@@ -100,29 +100,49 @@ const cosineSimilarity = (a: tf.Tensor, b: tf.Tensor): number => {
 };
 
 export const compareImages = async (url1: string, url2: string): Promise<number> => {
+  let emb1: tf.Tensor | null = null;
+  let emb2: tf.Tensor | null = null;
   try {
-    // Fetch and process both image embeddings at the same time
-    const [emb1, emb2] = await Promise.all([getImageEmbedding(url1), getImageEmbedding(url2)]);
+    [emb1, emb2] = await Promise.all([getImageEmbedding(url1), getImageEmbedding(url2)]);
     if (!emb1 || !emb2) return 0;
-
-    const similarity = cosineSimilarity(emb1, emb2);
-    
-    // Cleanup embeddings to prevent massive memory leaks over time
-    tf.dispose(emb1);
-    tf.dispose(emb2);
-    
-    return similarity;
+    return cosineSimilarity(emb1, emb2);
   } catch (error) {
     console.error("Image similarity error:", error);
     return 0;
+  } finally {
+    if (emb1) tf.dispose(emb1);
+    if (emb2) tf.dispose(emb2);
   }
+};
+
+/** Compare all pairs from two image URL arrays, return the highest similarity score (0–1). */
+export const compareMultipleImages = async (urls1: string[], urls2: string[]): Promise<number> => {
+  if (!urls1.length || !urls2.length) return 0;
+  let best = 0;
+  for (const u1 of urls1) {
+    for (const u2 of urls2) {
+      const score = embeddingSimilarityTo01(await compareImages(u1, u2));
+      if (score > best) best = score;
+    }
+  }
+  return best;
+};
+
+const SYNONYMS: Record<string, string> = {
+  backpack: 'bag', pouch: 'bag', purse: 'bag',
+  billfold: 'wallet',
+  cellphone: 'phone', mobile: 'phone',
+  spectacles: 'glasses', eyeglasses: 'glasses',
 };
 
 // Jaccard similarity on word tokens
 export const compareText = (a: string, b: string): number => {
   if (!a || !b) return 0;
-  
-  const tokenize = (s: string) => new Set(s.toLowerCase().replace(/[^a-z0-9 ]/g, '').split(/\s+/).filter(Boolean));
+
+  const tokenize = (s: string) => new Set(
+    s.toLowerCase().replace(/[^a-z0-9 ]/g, '').split(/\s+/).filter(Boolean)
+      .map((w) => SYNONYMS[w] ?? w)
+  );
   const setA = tokenize(a);
   const setB = tokenize(b);
   

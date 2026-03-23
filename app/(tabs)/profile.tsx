@@ -38,6 +38,7 @@ type Post = {
   description: string;
   location: string;
   imageUrl?: string;
+  imageUrls?: string[];
   createdAt?: any;
 };
 
@@ -243,8 +244,8 @@ export default function ProfileScreen() {
             posts.map((post) => (
               <View key={post.id} style={styles.postCard}>
                 {/* Image */}
-                {post.imageUrl ? (
-                  <Image source={{ uri: post.imageUrl }} style={styles.postThumb} />
+                {(post.imageUrls?.[0] ?? post.imageUrl) ? (
+                  <Image source={{ uri: post.imageUrls?.[0] ?? post.imageUrl }} style={styles.postThumb} />
                 ) : (
                   <View style={[styles.postThumb, styles.postThumbPlaceholder]}>
                     <Ionicons name="image-outline" size={24} color="#9CA3AF" />

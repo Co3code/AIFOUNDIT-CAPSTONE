@@ -2,7 +2,7 @@ import { auth, db } from "@/config/firebase";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "@react-navigation/native";
 import { collection, documentId, getDocs, query, where } from "firebase/firestore";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -46,100 +46,75 @@ async function batchGetDocs(collectionName: string, ids: string[]): Promise<Reco
 export default function MatchesScreen() {
   const [pairs, setPairs] = useState<MatchPair[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const lastFetchRef = useRef<number>(0);
 
   const fetchMatches = useCallback(async () => {
     setLoading(true);
-    const uid = auth.currentUser?.uid;
-    if (!uid) {
-      setLoading(false);
-      return;
-    }
+    setError(null);
+    try {
+      const uid = auth.currentUser?.uid;
+      if (!uid) return;
 
-    // ── Step 1: Fetch all my posts ──────────────────────────────────────────
-    const postsSnap = await getDocs(query(collection(db, "posts"), where("postedBy", "==", uid)));
-    const myPostsMap: Record<string, any> = {};
-    postsSnap.docs.forEach((d) => {
-      myPostsMap[d.id] = { id: d.id, ...d.data() };
-    });
-    const myPostIds = Object.keys(myPostsMap);
-    if (myPostIds.length === 0) {
-      setPairs([]);
-      setLoading(false);
-      return;
-    }
+      const postsSnap = await getDocs(query(collection(db, "posts"), where("postedBy", "==", uid)));
+      const myPostsMap: Record<string, any> = {};
+      postsSnap.docs.forEach((d) => { myPostsMap[d.id] = { id: d.id, ...d.data() }; });
+      const myPostIds = Object.keys(myPostsMap);
+      if (myPostIds.length === 0) { setPairs([]); return; }
 
-    // ── Step 2: Fetch all match docs for my posts in parallel ───────────────
-    const matchSnapPromises: Promise<any>[] = [];
-    for (let i = 0; i < myPostIds.length; i += 10) {
-      const chunk = myPostIds.slice(i, i + 10);
-      matchSnapPromises.push(getDocs(query(collection(db, "matches"), where("postId", "in", chunk))));
-    }
-    const matchSnaps = await Promise.all(matchSnapPromises);
-    const allMatchDocs = matchSnaps.flatMap((s) => s.docs);
-
-    if (allMatchDocs.length === 0) {
-      setPairs([]);
-      setLoading(false);
-      return;
-    }
-
-    // ── Step 3: Collect all matched post IDs (deduplicated) ─────────────────
-    const matchedPostIds: string[] = [];
-    for (const matchDoc of allMatchDocs) {
-      const data = matchDoc.data();
-      if (!myPostsMap[data.postId]) continue;
-      for (const m of data.matches ?? []) {
-        matchedPostIds.push(m.postId);
+      const matchSnapPromises: Promise<any>[] = [];
+      for (let i = 0; i < myPostIds.length; i += 10) {
+        const chunk = myPostIds.slice(i, i + 10);
+        matchSnapPromises.push(getDocs(query(collection(db, "matches"), where("postId", "in", chunk))));
       }
-    }
+      const matchSnaps = await Promise.all(matchSnapPromises);
+      const allMatchDocs = matchSnaps.flatMap((s) => s.docs);
+      if (allMatchDocs.length === 0) { setPairs([]); return; }
 
-    // ── Step 4: Batch fetch all matched posts in parallel ───────────────────
-    // FIX: Instead of getDoc() per post, fetch all at once using `in` queries
-    const matchedPostsMap = await batchGetDocs("posts", matchedPostIds);
-
-    // ── Step 5: Collect all matched user IDs (deduplicated) ─────────────────
-    const matchedUserIds = [
-      ...new Set(
-        Object.values(matchedPostsMap)
-          .map((p: any) => p.postedBy)
-          .filter(Boolean),
-      ),
-    ];
-
-    // ── Step 6: Batch fetch all matched users in parallel ───────────────────
-    // FIX: Instead of getDoc() per user, fetch all at once
-    const matchedUsersMap = await batchGetDocs("users", matchedUserIds);
-
-    // ── Step 7: Assemble pairs ───────────────────────────────────────────────
-    const result: MatchPair[] = [];
-    for (const matchDoc of allMatchDocs) {
-      const data = matchDoc.data();
-      const myPost = myPostsMap[data.postId];
-      if (!myPost) continue;
-
-      for (const m of data.matches ?? []) {
-        const matchedPost = matchedPostsMap[m.postId];
-        if (!matchedPost) continue;
-
-        const matchedUser = matchedUsersMap[matchedPost.postedBy] ?? null;
-
-        result.push({
-          matchDocId: `${matchDoc.id}_${m.postId}`,
-          myPost,
-          matchedPost,
-          matchedUser,
-          score: m.score,
-        });
+      const matchedPostIds: string[] = [];
+      for (const matchDoc of allMatchDocs) {
+        const data = matchDoc.data();
+        if (!myPostsMap[data.postId]) continue;
+        for (const m of data.matches ?? []) matchedPostIds.push(m.postId);
       }
-    }
 
-    result.sort((a, b) => b.score - a.score);
-    setPairs(result);
-    setLoading(false);
+      const matchedPostsMap = await batchGetDocs("posts", matchedPostIds);
+      const matchedUserIds = [
+        ...new Set(Object.values(matchedPostsMap).map((p: any) => p.postedBy).filter(Boolean)),
+      ];
+      const matchedUsersMap = await batchGetDocs("users", matchedUserIds);
+
+      const result: MatchPair[] = [];
+      for (const matchDoc of allMatchDocs) {
+        const data = matchDoc.data();
+        const myPost = myPostsMap[data.postId];
+        if (!myPost) continue;
+        for (const m of data.matches ?? []) {
+          const matchedPost = matchedPostsMap[m.postId];
+          if (!matchedPost) continue;
+          result.push({
+            matchDocId: `${matchDoc.id}||${m.postId}`,
+            myPost,
+            matchedPost,
+            matchedUser: matchedUsersMap[matchedPost.postedBy] ?? null,
+            score: m.score,
+          });
+        }
+      }
+
+      result.sort((a, b) => b.score - a.score);
+      setPairs(result);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to load matches. Please try again.");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useFocusEffect(
     useCallback(() => {
+      if (Date.now() - lastFetchRef.current < 30_000) return;
+      lastFetchRef.current = Date.now();
       fetchMatches();
     }, [fetchMatches]),
   );
@@ -166,6 +141,17 @@ export default function MatchesScreen() {
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#2563EB" />
         <Text style={styles.loadingText}>Loading matches...</Text>
+      </View>
+    );
+
+  if (error)
+    return (
+      <View style={styles.loadingContainer}>
+        <Ionicons name="alert-circle-outline" size={40} color="#EF4444" />
+        <Text style={styles.errorText}>{error}</Text>
+        <TouchableOpacity style={styles.retryBtn} onPress={fetchMatches}>
+          <Text style={styles.retryBtnText}>Retry</Text>
+        </TouchableOpacity>
       </View>
     );
 
@@ -282,6 +268,9 @@ const styles = StyleSheet.create({
   empty: { flex: 1, justifyContent: "center", alignItems: "center", gap: 8, padding: 32 },
   emptyTitle: { fontSize: 15, fontWeight: "bold", color: "#374151" },
   emptyText: { fontSize: 13, color: "#9CA3AF", textAlign: "center" },
+  errorText: { fontSize: 14, color: "#EF4444", textAlign: "center" },
+  retryBtn: { marginTop: 8, backgroundColor: "#2563EB", paddingHorizontal: 24, paddingVertical: 10, borderRadius: 8 },
+  retryBtnText: { color: "#fff", fontWeight: "bold", fontSize: 14 },
 
   card: {
     backgroundColor: "#fff",

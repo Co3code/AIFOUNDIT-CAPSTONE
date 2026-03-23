@@ -1,6 +1,6 @@
 import { CLOUDINARY_UPLOAD_PRESET, CLOUDINARY_UPLOAD_URL } from "@/config/cloudinary";
 import { auth, db } from "@/config/firebase";
-import { combinedScoreToPercent, compareImages, compareText, embeddingSimilarityTo01 } from "@/config/similarity";
+import { combinedScoreToPercent, compareMultipleImages, compareText } from "@/config/similarity";
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import { addDoc, collection, doc, getDocs, query, serverTimestamp, setDoc, where } from "firebase/firestore";
@@ -47,11 +47,14 @@ async function upsertMatchEntry(postId: string, otherPostId: string, score: numb
 }
 
 export default function PostScreen() {
+  const CATEGORIES = ["bag", "phone", "wallet", "glasses", "keys", "clothing", "electronics", "other"];
+
   const [type, setType] = useState<"lost" | "found">("lost");
+  const [category, setCategory] = useState("other");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [location, setLocation] = useState("");
-  const [image, setImage] = useState<string | null>(null);
+  const [images, setImages] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
 
@@ -61,14 +64,14 @@ export default function PostScreen() {
       allowsEditing: true,
       quality: 0.7,
     });
-    if (!result.canceled) setImage(result.assets[0].uri);
+    if (!result.canceled) setImages((prev) => [...prev, result.assets[0].uri]);
   };
 
   const takePhoto = async () => {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) return Alert.alert("Permission required", "Camera permission is needed");
     const result = await ImagePicker.launchCameraAsync({ allowsEditing: true, quality: 0.7 });
-    if (!result.canceled) setImage(result.assets[0].uri);
+    if (!result.canceled) setImages((prev) => [...prev, result.assets[0].uri]);
   };
 
   const uploadImage = async (uri: string): Promise<string> => {
@@ -81,65 +84,80 @@ export default function PostScreen() {
     return data.secure_url;
   };
 
-  // ─── FIX 2: Smarter scoring — image is optional, weights adjust accordingly ─
   const computeScore = async (
-    newPost: { imageUrl: string; description: string; location: string; title: string; type: string },
+    newPost: { imageUrls: string[]; description: string; location: string; title: string; category: string },
     otherPost: any,
   ): Promise<number> => {
-    const hasImages = !!newPost.imageUrl && !!otherPost.imageUrl;
+    // Skip only if both posts have a category and they don't match
+    const bothHaveCategory = !!newPost.category && !!otherPost.category;
+    if (bothHaveCategory && newPost.category !== otherPost.category) return 0;
 
-    let imageScore01 = 0;
-    if (hasImages) {
-      const raw = await compareImages(newPost.imageUrl, otherPost.imageUrl as string);
-      imageScore01 = embeddingSimilarityTo01(raw);
-    }
+    const urls1 = newPost.imageUrls ?? [];
+    const urls2: string[] = otherPost.imageUrls ?? (otherPost.imageUrl ? [otherPost.imageUrl] : []);
+    const hasImages = urls1.length > 0 && urls2.length > 0;
 
+    const imageScore01 = hasImages ? await compareMultipleImages(urls1, urls2) : 0;
     const descScore = compareText(newPost.description, otherPost.description ?? "");
     const locScore = compareText(newPost.location, otherPost.location ?? "");
     const titleScore = compareText(newPost.title, otherPost.title ?? "");
 
-    // FIX 2b: If no images, redistribute image weight to text fields
     const combined = hasImages
-      ? imageScore01 * 0.4 + descScore * 0.3 + locScore * 0.2 + titleScore * 0.1
-      : descScore * 0.45 + locScore * 0.3 + titleScore * 0.25;
+      ? imageScore01 * 0.3 + descScore * 0.3 + locScore * 0.25 + titleScore * 0.15
+      : descScore * 0.45 + locScore * 0.4 + titleScore * 0.15;
 
     return combinedScoreToPercent(combined);
   };
 
-  // ─── FIX 3: Parallel image comparison using Promise.all ───────────────────
+    type ConcurrentTask<T> = () => Promise<T>;
+  type ScoreResult = { id: string; post: Record<string, any>; score: number; matchLabel: string };
+
+  const runWithConcurrency = async <T,>(tasks: ConcurrentTask<T>[], limit: number): Promise<T[]> => {
+    const results: T[] = [];
+    for (let i = 0; i < tasks.length; i += limit) {
+      const batch = tasks.slice(i, i + limit).map((t) => t());
+      results.push(...(await Promise.all(batch)));
+    }
+    return results;
+  };
+
   const findMatches = async (
-    newImageUrl: string,
-    newPost: { type: string; description: string; location: string; title: string },
+    newImageUrls: string[],
+    newPost: { type: string; description: string; location: string; title: string; category: string },
     currentUid: string,
     newPostId: string,
   ) => {
     const oppositeType = newPost.type === "lost" ? "found" : "lost";
     const snap = await getDocs(query(collection(db, "posts"), where("type", "==", oppositeType)));
 
-    const candidates = snap.docs.filter((d) => d.data().postedBy !== currentUid);
+    const candidates = snap.docs.filter((d) => {
+      const data = d.data();
+      if (data.postedBy === currentUid) return false;
+      const bothHaveCategory = !!newPost.category && !!data.category;
+      if (bothHaveCategory && data.category !== newPost.category) return false;
+      return true;
+    });
 
-    // FIX 3: Run all comparisons in parallel instead of serial loop
-    const scoreResults = await Promise.all(
-      candidates.map(async (docSnap) => {
-        const post = docSnap.data();
-        const score = await computeScore({ imageUrl: newImageUrl, ...newPost }, post);
-        return { id: docSnap.id, post, score };
-      }),
-    );
+    const tasks = candidates.map((docSnap) => async () => {
+      const post = docSnap.data();
+      const score = await computeScore({ imageUrls: newImageUrls, ...newPost }, post);
+      const matchLabel = score >= 80 ? "strong match" : "possible match";
+      return { id: docSnap.id, post, score, matchLabel };
+    });
 
-    // Filter threshold and sort
-    const THRESHOLD = 28; // 28% minimum confidence
+    const scoreResults = await runWithConcurrency<ScoreResult>(tasks, 3);
+
+    const THRESHOLD = 60;
     return scoreResults.filter((r) => r.score >= THRESHOLD).sort((a, b) => b.score - a.score);
   };
 
   const handleSubmit = async () => {
-    if (!title || !description || !location || !image)
-      return Alert.alert("Error", "Please fill in all fields and add an image");
+    if (!title || !description || !location)
+      return Alert.alert("Error", "Please fill in all fields");
 
     setLoading(true);
     try {
-      setStatusMsg("Uploading image...");
-      const imageUrl = await uploadImage(image);
+      setStatusMsg("Uploading images...");
+      const imageUrls = await Promise.all(images.map((uri) => uploadImage(uri)));
 
       setStatusMsg("Saving post...");
       const uid = auth.currentUser?.uid;
@@ -147,41 +165,67 @@ export default function PostScreen() {
 
       const docRef = await addDoc(collection(db, "posts"), {
         type,
+        category,
         title,
         description,
         location,
-        imageUrl,
+        imageUrls,
         postedBy: uid,
         createdAt: serverTimestamp(),
       });
 
       setStatusMsg("Finding matches... (this may take a moment)");
-      const matches = await findMatches(imageUrl, { type, description, location, title }, uid, docRef.id);
+      const matches = await findMatches(imageUrls, { type, category, description, location, title }, uid, docRef.id);
 
       // ─── FIX 4: Write matches ONCE via upsertMatchEntry only — no double addDoc ─
       if (matches.length > 0) {
-        // Write match doc for the new post (one doc, all matches)
         await upsertMatchEntry(docRef.id, matches[0].id, matches[0].score);
         for (let i = 1; i < matches.length; i++) {
           await upsertMatchEntry(docRef.id, matches[i].id, matches[i].score);
         }
-        // Write reverse match entries so the other users also see this post
         for (const m of matches) {
           await upsertMatchEntry(m.id, docRef.id, m.score);
         }
-        Alert.alert(
-          "🎉 Match Found!",
-          `We found ${matches.length} possible match${matches.length > 1 ? "es" : ""} for your item!\nCheck the Matches tab.`,
-        );
+
+        // Save notifications
+        const notifPromises: Promise<any>[] = [];
+
+        // Notify current user
+        notifPromises.push(addDoc(collection(db, 'notifications'), {
+          userId: uid,
+          title: 'Match Found',
+          message: `We found ${matches.length} possible match${matches.length > 1 ? 'es' : ''} for your item "${title}".`,
+          postId: docRef.id,
+          read: false,
+          createdAt: serverTimestamp(),
+        }));
+
+        // Notify each matched post owner
+        for (const m of matches) {
+          if (m.post.postedBy && m.post.postedBy !== uid) {
+            notifPromises.push(addDoc(collection(db, 'notifications'), {
+              userId: m.post.postedBy,
+              title: 'Possible Match Found',
+              message: `Someone posted "${title}" that may match your "${m.post.title}".`,
+              postId: m.id,
+              read: false,
+              createdAt: serverTimestamp(),
+            }));
+          }
+        }
+
+        await Promise.all(notifPromises);
+
+        Alert.alert('Match Found!', `We found ${matches.length} possible match${matches.length > 1 ? 'es' : ''} for your item! Check the Matches tab.`);
       } else {
-        Alert.alert("✅ Post Submitted", "No matches yet. We'll notify you when one is found.");
+        Alert.alert('Post Submitted', "No matches yet. We'll notify you when one is found.");
       }
 
-      // Reset form
       setTitle("");
       setDescription("");
       setLocation("");
-      setImage(null);
+      setImages([]);
+      setCategory("other");
       setType("lost");
     } catch (error: any) {
       console.error("Submit error:", error);
@@ -217,22 +261,37 @@ export default function PostScreen() {
       </View>
 
       <View style={styles.form}>
-        <Text style={styles.label}>Photo</Text>
-        {image ? (
-          <TouchableOpacity onPress={pickImage}>
-            <Image source={{ uri: image }} style={styles.imagePreview} />
-            <Text style={styles.changePhoto}>Tap to change photo</Text>
+        <Text style={styles.label}>Category</Text>
+        <View style={styles.categoryRow}>
+          {CATEGORIES.map((c) => (
+            <TouchableOpacity
+              key={c}
+              style={[styles.categoryBtn, category === c && styles.categoryBtnActive]}
+              onPress={() => setCategory(c)}
+            >
+              <Text style={[styles.categoryBtnText, category === c && { color: "#fff" }]}>{c}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <Text style={styles.label}>Photos</Text>
+        <View style={styles.imageButtons}>
+          <TouchableOpacity style={styles.imageBtn} onPress={takePhoto}>
+            <Ionicons name="camera-outline" size={22} color="#2563EB" />
+            <Text style={styles.imageBtnText}>Camera</Text>
           </TouchableOpacity>
-        ) : (
-          <View style={styles.imageButtons}>
-            <TouchableOpacity style={styles.imageBtn} onPress={takePhoto}>
-              <Ionicons name="camera-outline" size={22} color="#2563EB" />
-              <Text style={styles.imageBtnText}>Camera</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.imageBtn} onPress={pickImage}>
-              <Ionicons name="image-outline" size={22} color="#2563EB" />
-              <Text style={styles.imageBtnText}>Gallery</Text>
-            </TouchableOpacity>
+          <TouchableOpacity style={styles.imageBtn} onPress={pickImage}>
+            <Ionicons name="image-outline" size={22} color="#2563EB" />
+            <Text style={styles.imageBtnText}>Gallery</Text>
+          </TouchableOpacity>
+        </View>
+        {images.length > 0 && (
+          <View style={styles.imageRow}>
+            {images.map((uri, i) => (
+              <TouchableOpacity key={i} onPress={() => setImages((prev) => prev.filter((_, idx) => idx !== i))}>
+                <Image source={{ uri }} style={styles.imageThumbnail} />
+              </TouchableOpacity>
+            ))}
           </View>
         )}
 
@@ -317,6 +376,8 @@ const styles = StyleSheet.create({
     color: "#111827",
   },
   imageButtons: { flexDirection: "row", gap: 12 },
+  imageRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
+  imageThumbnail: { width: 80, height: 80, borderRadius: 8 },
   imageBtn: {
     flex: 1,
     flexDirection: "row",
@@ -330,6 +391,17 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   imageBtnText: { color: "#2563EB", fontWeight: "600" },
+  categoryRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
+  categoryBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    backgroundColor: "#fff",
+  },
+  categoryBtnActive: { backgroundColor: "#2563EB", borderColor: "#2563EB" },
+  categoryBtnText: { fontSize: 12, fontWeight: "600", color: "#6B7280", textTransform: "capitalize" },
   imagePreview: { width: "100%", height: 200, borderRadius: 12 },
   changePhoto: { textAlign: "center", color: "#6B7280", fontSize: 12, marginTop: 6 },
   submitBtn: {

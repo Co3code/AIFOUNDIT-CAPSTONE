@@ -153,7 +153,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#334155",
   },
-  statCardWide: { minWidth: "100%" },
+  statCardWide: { flexBasis: '100%', minWidth: 0 },
   statNumber: { fontSize: 28, fontWeight: "bold", color: "#F8FAFC" },
   statLabel: { fontSize: 12, color: "#94A3B8" },
   quickActions: {
