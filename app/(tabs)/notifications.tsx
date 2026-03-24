@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react';
 import { View, Text, StyleSheet, FlatList, ActivityIndicator, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
+import { router } from 'expo-router';
 import { db, auth } from '@/config/firebase';
 import { collection, query, where, getDocs, orderBy, doc, updateDoc, writeBatch } from 'firebase/firestore';
 
@@ -11,6 +12,7 @@ type Notification = {
   message: string;
   read: boolean;
   createdAt: any;
+  postId?: string;
 };
 
 export default function NotificationsScreen() {
@@ -92,7 +94,10 @@ export default function NotificationsScreen() {
           renderItem={({ item }) => (
             <TouchableOpacity
               style={[styles.card, !item.read && styles.cardUnread]}
-              onPress={() => markAsRead(item.id)}
+              onPress={async () => {
+                await markAsRead(item.id);
+                if (item.postId) router.push({ pathname: '/post-detail', params: { postId: item.postId } });
+              }}
               activeOpacity={0.7}
             >
               <View style={[styles.iconWrap, { backgroundColor: item.read ? '#F3F4F6' : '#EFF6FF' }]}>

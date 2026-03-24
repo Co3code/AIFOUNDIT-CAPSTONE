@@ -3,7 +3,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "@react-navigation/native";
 import { router } from "expo-router";
 import { signOut } from "firebase/auth";
-import { collection, getCountFromServer } from "firebase/firestore";
+import { collection, getCountFromServer, query, where } from "firebase/firestore";
 import { useCallback, useState } from "react";
 import { ActivityIndicator, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
@@ -11,20 +11,23 @@ export default function AdminDashboard() {
   const [totalUsers, setTotalUsers] = useState(0);
   const [totalPosts, setTotalPosts] = useState(0);
   const [totalMatches, setTotalMatches] = useState(0);
+  const [totalResolved, setTotalResolved] = useState(0);
   const [loading, setLoading] = useState(true);
 
   // ✅ Fix: useFocusEffect so stats refresh every time admin comes back to dashboard
   const fetchStats = useCallback(async () => {
     setLoading(true);
     try {
-      const [usersSnap, postsSnap, matchesSnap] = await Promise.all([
+      const [usersSnap, postsSnap, matchesSnap, resolvedSnap] = await Promise.all([
         getCountFromServer(collection(db, "users")),
         getCountFromServer(collection(db, "posts")),
         getCountFromServer(collection(db, "matches")),
+        getCountFromServer(query(collection(db, "posts"), where("status", "==", "resolved"))),
       ]);
       setTotalUsers(usersSnap.data().count);
       setTotalPosts(postsSnap.data().count);
       setTotalMatches(matchesSnap.data().count);
+      setTotalResolved(resolvedSnap.data().count);
     } catch (e) {
       console.error("Failed to fetch stats:", e);
     } finally {
@@ -76,6 +79,11 @@ export default function AdminDashboard() {
             <Ionicons name="git-compare-outline" size={28} color="#A78BFA" />
             <Text style={styles.statNumber}>{totalMatches}</Text>
             <Text style={styles.statLabel}>AI Match Records</Text>
+          </View>
+          <View style={[styles.statCard, styles.statCardWide]}>
+            <Ionicons name="checkmark-done-circle" size={28} color="#34D399" />
+            <Text style={styles.statNumber}>{totalResolved}</Text>
+            <Text style={styles.statLabel}>Resolved Cases</Text>
           </View>
         </View>
       )}

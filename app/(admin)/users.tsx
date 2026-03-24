@@ -5,6 +5,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { auth, db } from '@/config/firebase';
+import { sendPasswordResetEmail } from 'firebase/auth';
 import {
   collection, getDocs, doc, updateDoc, query, where, deleteDoc,
 } from 'firebase/firestore';
@@ -153,6 +154,28 @@ export default function UsersScreen() {
     );
   };
 
+  const handleResetPassword = (item: User) => {
+    if (!item.email) return Alert.alert('No email', 'This user has no email on file.');
+    Alert.alert(
+      'Reset Password',
+      `Send a password reset email to ${item.email}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Send',
+          onPress: async () => {
+            try {
+              await sendPasswordResetEmail(auth, item.email!);
+              Alert.alert('Sent', `Password reset email sent to ${item.email}.`);
+            } catch (e: any) {
+              Alert.alert('Error', e?.message ?? 'Could not send reset email.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
   const deleteUserPosts = (item: User) => {
     Alert.alert(
       'Delete all posts',
@@ -219,6 +242,9 @@ export default function UsersScreen() {
                   <>
                     <TouchableOpacity style={styles.iconBtn} onPress={() => openEdit(item)}>
                       <Ionicons name="create-outline" size={20} color="#1E293B" />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.iconBtnKey} onPress={() => handleResetPassword(item)}>
+                      <Ionicons name="key-outline" size={20} color="#60A5FA" />
                     </TouchableOpacity>
                     {!isSelf && (
                       <TouchableOpacity
@@ -321,6 +347,7 @@ const styles = StyleSheet.create({
   badgeText: { fontSize: 10, color: '#FBBF24', fontWeight: 'bold' },
   actions: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   iconBtn: { padding: 8, borderRadius: 8, backgroundColor: '#334155' },
+  iconBtnKey: { padding: 8, borderRadius: 8, backgroundColor: 'rgba(96, 165, 250, 0.15)' },
   iconBtnDanger: { padding: 8, borderRadius: 8, backgroundColor: 'rgba(185, 28, 28, 0.2)' },
   iconBtnDelete: { padding: 8, borderRadius: 8, backgroundColor: '#B91C1C' },
   modalOverlay: {

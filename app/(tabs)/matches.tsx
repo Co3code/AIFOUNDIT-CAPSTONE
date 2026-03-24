@@ -1,7 +1,7 @@
 import { auth, db } from "@/config/firebase";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "@react-navigation/native";
-import { collection, documentId, getDocs, query, where } from "firebase/firestore";
+import { arrayUnion, collection, doc, documentId, getDoc, getDocs, query, updateDoc, where } from "firebase/firestore";
 import { useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -17,10 +17,12 @@ import {
 
 type MatchPair = {
   matchDocId: string;
+  matchFirestoreId: string;  // actual Firestore match doc ID
   myPost: any;
   matchedPost: any;
   matchedUser: any;
   score: number;
+  retrievedBy: string[];
 };
 
 // ─── Helper: batch fetch docs by IDs (Firestore `in` max 10) ─────────────────
@@ -94,10 +96,12 @@ export default function MatchesScreen() {
           if (!matchedPost) continue;
           result.push({
             matchDocId: `${matchDoc.id}||${m.postId}`,
+            matchFirestoreId: matchDoc.id,
             myPost,
             matchedPost,
             matchedUser: matchedUsersMap[matchedPost.postedBy] ?? null,
             score: m.score,
+            retrievedBy: data.retrievedBy ?? [],
           });
         }
       }
@@ -113,11 +117,49 @@ export default function MatchesScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      if (Date.now() - lastFetchRef.current < 30_000) return;
       lastFetchRef.current = Date.now();
       fetchMatches();
     }, [fetchMatches]),
   );
+
+  const handleMarkRetrieved = async (pair: MatchPair) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    try {
+      const matchRef = doc(db, "matches", pair.matchFirestoreId);
+      await updateDoc(matchRef, { retrievedBy: arrayUnion(uid) });
+
+      // Re-fetch the match doc to get the real retrievedBy array after update
+      const freshMatchDoc = await getDoc(matchRef);
+      const freshRetrievedBy: string[] = freshMatchDoc.data()?.retrievedBy ?? [];
+
+      const bothConfirmed =
+        freshRetrievedBy.includes(pair.myPost.postedBy) &&
+        freshRetrievedBy.includes(pair.matchedPost.postedBy);
+
+      if (bothConfirmed) {
+        await Promise.all([
+          updateDoc(doc(db, "posts", pair.myPost.id), { status: "resolved" }),
+          updateDoc(doc(db, "posts", pair.matchedPost.id), { status: "resolved" }),
+        ]);
+      }
+
+      setPairs((prev) =>
+        prev.map((p) =>
+          p.matchDocId === pair.matchDocId
+            ? {
+                ...p,
+                retrievedBy: freshRetrievedBy,
+                myPost: bothConfirmed ? { ...p.myPost, status: "resolved" } : p.myPost,
+                matchedPost: bothConfirmed ? { ...p.matchedPost, status: "resolved" } : p.matchedPost,
+              }
+            : p,
+        ),
+      );
+    } catch (e: any) {
+      Alert.alert("Error", e?.message ?? "Could not update.");
+    }
+  };
 
   const handleContact = (matchedUser: any) => {
     const email = matchedUser?.email;
@@ -177,16 +219,28 @@ export default function MatchesScreen() {
           data={pairs}
           keyExtractor={(item) => item.matchDocId}
           contentContainerStyle={{ padding: 16, gap: 16 }}
-          renderItem={({ item }) => <MatchCard pair={item} onContact={handleContact} />}
+          renderItem={({ item }) => (
+            <MatchCard pair={item} onContact={handleContact} onMarkRetrieved={handleMarkRetrieved} currentUid={auth.currentUser?.uid ?? ""} />
+          )}
         />
       )}
     </View>
   );
 }
 
-function MatchCard({ pair, onContact }: { pair: MatchPair; onContact: (u: any) => void }) {
-  const { myPost, matchedPost, matchedUser, score } = pair;
+function MatchCard({
+  pair, onContact, onMarkRetrieved, currentUid,
+}: {
+  pair: MatchPair;
+  onContact: (u: any) => void;
+  onMarkRetrieved: (p: MatchPair) => void;
+  currentUid: string;
+}) {
+  const { myPost, matchedPost, matchedUser, score, retrievedBy } = pair;
   const scoreColor = score >= 70 ? "#16A34A" : score >= 40 ? "#D97706" : "#6B7280";
+  const isResolved = myPost.status === "resolved" || matchedPost.status === "resolved";
+  const iConfirmed = retrievedBy.includes(currentUid);
+  const bothConfirmed = isResolved;
 
   return (
     <View style={styles.card}>
@@ -225,6 +279,26 @@ function MatchCard({ pair, onContact }: { pair: MatchPair; onContact: (u: any) =
           <Text style={styles.contactBtnText}>Contact</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Mark as Retrieved */}
+      <View style={styles.retrieveRow}>
+        {bothConfirmed ? (
+          <View style={styles.retrievedDone}>
+            <Ionicons name="checkmark-circle" size={16} color="#16A34A" />
+            <Text style={styles.retrievedDoneText}>Item Retrieved</Text>
+          </View>
+        ) : iConfirmed ? (
+          <View style={styles.retrievedWaiting}>
+            <Ionicons name="time-outline" size={16} color="#D97706" />
+            <Text style={styles.retrievedWaitingText}>Waiting for other user to confirm</Text>
+          </View>
+        ) : (
+          <TouchableOpacity style={styles.retrieveBtn} onPress={() => onMarkRetrieved(pair)}>
+            <Ionicons name="bag-check-outline" size={15} color="#fff" />
+            <Text style={styles.retrieveBtnText}>Mark as Retrieved</Text>
+          </TouchableOpacity>
+        )}
+      </View>
     </View>
   );
 }
@@ -233,8 +307,8 @@ function PostSide({ post, label, labelColor }: { post: any; label: string; label
   return (
     <View style={styles.side}>
       <Text style={[styles.sideLabel, { color: labelColor }]}>{label}</Text>
-      {post.imageUrl ? (
-        <Image source={{ uri: post.imageUrl }} style={styles.sideImage} />
+      {(post.imageUrls?.[0] ?? post.imageUrl) ? (
+        <Image source={{ uri: post.imageUrls?.[0] ?? post.imageUrl }} style={styles.sideImage} />
       ) : (
         <View style={[styles.sideImage, styles.noImage]}>
           <Ionicons name="image-outline" size={28} color="#D1D5DB" />
@@ -330,4 +404,26 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
   contactBtnText: { color: "#fff", fontWeight: "bold", fontSize: 12 },
+
+  retrieveRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    alignItems: "center",
+    borderTopWidth: 1,
+    borderTopColor: "#F3F4F6",
+  },
+  retrieveBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#16A34A",
+    paddingHorizontal: 20,
+    paddingVertical: 9,
+    borderRadius: 20,
+  },
+  retrieveBtnText: { color: "#fff", fontWeight: "bold", fontSize: 13 },
+  retrievedDone: { flexDirection: "row", alignItems: "center", gap: 6 },
+  retrievedDoneText: { color: "#16A34A", fontWeight: "bold", fontSize: 13 },
+  retrievedWaiting: { flexDirection: "row", alignItems: "center", gap: 6 },
+  retrievedWaitingText: { color: "#D97706", fontSize: 12 },
 });

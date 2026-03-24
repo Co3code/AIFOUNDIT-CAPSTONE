@@ -22,6 +22,7 @@ export default function RegisterScreen() {
       await setDoc(doc(db, 'users', userCredential.user.uid), {
         name,
         email,
+        role: 'user',
         ...(phone.trim() ? { phone: phone.trim() } : {}),
         createdAt: new Date(),
       });
