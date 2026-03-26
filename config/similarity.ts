@@ -32,7 +32,7 @@ const isJpegMagic = (raw: Uint8Array) =>
 const loadModel = async () => {
   await ensureTfBackend();
   if (!model) {
-    model = await mobilenet.load({ version: 2, alpha: 0.5 });
+    model = await mobilenet.load({ version: 2, alpha: 1.0 });
   }
   return model;
 };
